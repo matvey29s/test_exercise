@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "stdbool.h": "c",
+        "omnicomm_lls_protocol.h": "c"
+    }
+}
