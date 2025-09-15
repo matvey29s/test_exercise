@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define USART USART2
+
 // Конфигурация протокола
 #define UART_BAUDRATE 19200
 #define RX_BUFFER_SIZE 256
@@ -39,8 +41,5 @@ typedef struct {
 
 // Инициализация UART
 void uart_init(void);
-
-// Callback для обработки валидного запроса
-extern void on_valid_request(uint8_t address);
 
 #endif /* UART_PROTOCOL_H */

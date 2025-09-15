@@ -140,16 +140,16 @@ static void process_received_byte(uint8_t data)
                 parser_state.crc_calculated == parser_state.request.crc) {
                 
                 // Пакет корректен - формируем и отправляем ответ
+                // Отправляем одни и те же данные
 
+                //TODO Реализовать прием различных данных с датчиков
                 int8_t temperature = 50;        // Пример: температура 50°C
                 uint16_t level = 0x1000;        // Пример: уровень 1000
                 uint16_t frequency = 0x5000;    // Пример: частота 5кГц
                 
                 // Отправка ответа
                 send_response_internal(parser_state.request.address, temperature, level, frequency);
-                
-                // Уведомление о валидном запросе (callback функция)
-                on_valid_request(parser_state.request.address);
+
             }
             // Если пакет невалиден - просто игнорируем его
             
