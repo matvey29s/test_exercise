@@ -1,14 +1,10 @@
-/* uart_protocol.h */
 #ifndef UART_PROTOCOL_H
 #define UART_PROTOCOL_H
 
 #include <stdint.h>
 #include <stdbool.h>
 
-#define USART USART2
-
 // Конфигурация протокола
-#define UART_BAUDRATE 19200
 #define RX_BUFFER_SIZE 256
 #define TX_BUFFER_SIZE 256
 
@@ -39,7 +35,23 @@ typedef struct {
     uint8_t crc;
 } __attribute__((packed)) response_frame_t;
 
-// Инициализация UART
-void uart_init(void);
+// Callback-функции для аппаратного уровня
+typedef void (*uart_send_byte_t)(uint8_t data);
+typedef void (*uart_enable_tx_interrupt_t)(void);
+typedef bool (*uart_is_tx_busy_t)(void);
+
+// Инициализация протокола
+void uart_protocol_init(uart_send_byte_t send_cb, 
+                       uart_enable_tx_interrupt_t enable_tx_cb,
+                       uart_is_tx_busy_t is_tx_busy_cb);
+
+// Обработка принятого байта
+void uart_protocol_process_byte(uint8_t data);
+
+// Получить данные для отправки (используется аппаратным уровнем)
+bool uart_protocol_get_tx_byte(uint8_t *data);
+
+// Уведомление об окончании передачи
+void uart_protocol_tx_complete(void);
 
 #endif /* UART_PROTOCOL_H */

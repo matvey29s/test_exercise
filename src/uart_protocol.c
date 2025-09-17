@@ -1,250 +1,171 @@
-/* uart_protocol.c */
 #include "uart_protocol.h"
-#include "stm32f4xx_ll_usart.h"
-#include "stm32f4xx_ll_gpio.h"
-#include "stm32f4xx_ll_bus.h"
-#include "stm32f4xx_ll_rcc.h"
 
 // Внутренние переменные
-// Буфер для приема данных (кольцевой буфер)
-static volatile uint8_t rx_buffer[RX_BUFFER_SIZE];
-static volatile uint16_t rx_head = 0;     // Указатель на запись
-static volatile uint16_t rx_tail = 0;     // Указатель на чтение
-static volatile uint16_t rx_count = 0;    // Количество байт в буфере
-
-// Буфер для передачи данных (кольцевой буфер)
 static uint8_t tx_buffer[TX_BUFFER_SIZE];
-static volatile uint16_t tx_head = 0;     // Указатель на запись
-static volatile uint16_t tx_tail = 0;     // Указатель на чтение
-static volatile uint16_t tx_count = 0;    // Количество байт в буфере
-static volatile bool tx_busy = false;     // Флаг занятости передачи
+static volatile uint16_t tx_head = 0;
+static volatile uint16_t tx_tail = 0;
+static volatile uint16_t tx_count = 0;
 
-// Состояние парсера - отслеживает текущее состояние разбора принятых данных
+// Состояние парсера
 static struct {
-    uint8_t state;              // Текущее состояние парсера
-    request_frame_t request;    // Структура для хранения разобранного запроса
-    uint8_t crc_calculated;     // Рассчитанное значение CRC для проверки
-    uint8_t bytes_received;     // Количество принятых байт текущего пакета
+    uint8_t state;
+    request_frame_t request;
+    uint8_t crc_calculated;
+    uint8_t bytes_received;
 } parser_state;
 
-// Расчет контрольной суммы CRC8 по заданному алгоритму
-// data - новый байт для расчета, crc - текущее значение CRC
+// Callback-функции для аппаратного уровня
+static uart_send_byte_t hardware_send_byte = NULL;
+static uart_enable_tx_interrupt_t hardware_enable_tx_interrupt = NULL;
+static uart_is_tx_busy_t hardware_is_tx_busy = NULL;
+
+// Расчет контрольной суммы CRC8
 static uint8_t calculate_crc8(uint8_t data, uint8_t crc)
 {
-    uint8_t i = data ^ crc;  // XOR нового байта с текущим CRC
-    crc = 0;  // Сброс CRC для расчета нового значения
+    uint8_t i = data ^ crc;
+    crc = 0;
     
-    // Побитовый расчет CRC согласно заданному полиному
-    if(i & 0x01) crc ^= 0x5E;  // Если установлен бит 0
-    if(i & 0x02) crc ^= 0xBC;  // Если установлен бит 1
-    if(i & 0x04) crc ^= 0x61;  // Если установлен бит 2
-    if(i & 0x08) crc ^= 0xC2;  // Если установлен бит 3
-    if(i & 0x10) crc ^= 0x9D;  // Если установлен бит 4
-    if(i & 0x20) crc ^= 0x23;  // Если установлен бит 5
-    if(i & 0x40) crc ^= 0x46;  // Если установлен бит 6
-    if(i & 0x80) crc ^= 0x8C;  // Если установлен бит 7
+    if(i & 0x01) crc ^= 0x5E;
+    if(i & 0x02) crc ^= 0xBC;
+    if(i & 0x04) crc ^= 0x61;
+    if(i & 0x08) crc ^= 0xC2;
+    if(i & 0x10) crc ^= 0x9D;
+    if(i & 0x20) crc ^= 0x23;
+    if(i & 0x40) crc ^= 0x46;
+    if(i & 0x80) crc ^= 0x8C;
     
     return crc;
 }
 
-// Добавление байта в буфер передачи (постановка в очередь)
+// Добавление байта в буфер передачи
 static void tx_buffer_put(uint8_t data)
 {
-    if (tx_count < TX_BUFFER_SIZE) {  // Если есть место в буфере
-        tx_buffer[tx_head] = data;    // Записываем данные
-        tx_head = (tx_head + 1) % TX_BUFFER_SIZE;  // Увеличиваем указатель с закольцовыванием
-        tx_count++;  // Увеличиваем счетчик байт в буфере
+    if (tx_count < TX_BUFFER_SIZE) {
+        tx_buffer[tx_head] = data;
+        tx_head = (tx_head + 1) % TX_BUFFER_SIZE;
+        tx_count++;
     }
 }
 
 // Запуск процесса передачи данных
 static void start_transmission(void)
 {
-    if (tx_count > 0 && !tx_busy) {  // Если есть что передавать и передача не занята
-        tx_busy = true;  // Устанавливаем флаг занятости
-        LL_USART_EnableIT_TXE(USART2);  // Включаем прерывание по готовности к передаче
-        // Это вызовет немедленное прерывание, если регистр передачи пуст
+    if (tx_count > 0 && hardware_send_byte && 
+        hardware_enable_tx_interrupt && !hardware_is_tx_busy()) {
+        hardware_enable_tx_interrupt();
     }
 }
 
-// Внутренняя функция формирования и отправки ответа
-static void send_response_internal(uint8_t address, int8_t temperature, uint16_t level, uint16_t frequency)
+// Формирование и отправка ответа
+static void send_response_internal(uint8_t address, int8_t temperature, 
+                                  uint16_t level, uint16_t frequency)
 {
-    response_frame_t response;  // Создаем структуру ответа
+    response_frame_t response;
     
-    // Заполняем поля ответа
-    response.header = RESPONSE_HEADER;      // Заголовок ответа (3Eh)
-    response.address = address;             // Адрес отправителя
-    response.opcode = OPCODE_RESPONSE;      // Код операции (06h)
-    response.temperature = temperature;     // Температура
-    response.level = level;                 // Уровень (2 байта)
-    response.frequency = frequency;         // Частота (2 байта)
+    response.header = RESPONSE_HEADER;
+    response.address = address;
+    response.opcode = OPCODE_RESPONSE;
+    response.temperature = temperature;
+    response.level = level;
+    response.frequency = frequency;
     
-    // Расчет контрольной суммы для ответа
-    uint8_t crc = 0;  // Начальное значение CRC
-    uint8_t *data = (uint8_t*)&response;  // Указатель на данные ответа
+    // Расчет CRC
+    uint8_t crc = 0;
+    uint8_t *data = (uint8_t*)&response;
     
-    // Расчет CRC для всех полей КРОМЕ самого CRC (sizeof-1)
     for (uint8_t i = 0; i < sizeof(response_frame_t) - 1; i++) {
-        crc = calculate_crc8(data[i], crc);  // Последовательно добавляем каждый байт
+        crc = calculate_crc8(data[i], crc);
     }
-    response.crc = crc;  // Записываем рассчитанный CRC в структуру
+    response.crc = crc;
     
-    // Добавление всего ответа в буфер передачи
+    // Добавление в буфер передачи
     for (uint8_t i = 0; i < sizeof(response_frame_t); i++) {
-        tx_buffer_put(data[i]);  // Постановка каждого байта в очередь на передачу
+        tx_buffer_put(data[i]);
     }
     
-    // Запуск передачи
     start_transmission();
 }
 
-// Обработка принятого байта - автомат состояний для разбора протокола
-static void process_received_byte(uint8_t data)
+// Инициализация протокола
+void uart_protocol_init(uart_send_byte_t send_cb, 
+                       uart_enable_tx_interrupt_t enable_tx_cb,
+                       uart_is_tx_busy_t is_tx_busy_cb)
+{
+    hardware_send_byte = send_cb;
+    hardware_enable_tx_interrupt = enable_tx_cb;
+    hardware_is_tx_busy = is_tx_busy_cb;
+    
+    parser_state.state = 0;
+    parser_state.bytes_received = 0;
+}
+
+// Обработка принятого байта
+void uart_protocol_process_byte(uint8_t data)
 {
     switch (parser_state.state) {
-        case 0: // Состояние 0: Ожидание заголовка пакета
-            if (data == REQUEST_HEADER) {  // Если получен корректный заголовок (31h)
-                parser_state.request.header = data;  // Сохраняем заголовок
-                parser_state.crc_calculated = calculate_crc8(data, 0);  // Начинаем расчет CRC
-                parser_state.bytes_received = 1;     // Первый байт принят
-                parser_state.state = 1;              // Переходим к следующему состоянию
+        case 0: // Ожидание заголовка
+            if (data == REQUEST_HEADER) {
+                parser_state.request.header = data;
+                parser_state.crc_calculated = calculate_crc8(data, 0);
+                parser_state.bytes_received = 1;
+                parser_state.state = 1;
             }
-            // Если заголовок не совпадает - байт игнорируется, остаемся в состоянии 0
             break;
             
-        case 1: // Состояние 1: Ожидание байта адреса
-            parser_state.request.address = data;  // Сохраняем адрес
-            parser_state.crc_calculated = calculate_crc8(data, parser_state.crc_calculated);  // Продолжаем CRC
-            parser_state.bytes_received++;        // Увеличиваем счетчик байт
-            parser_state.state = 2;               // Переходим к следующему состоянию
+        case 1: // Ожидание адреса
+            parser_state.request.address = data;
+            parser_state.crc_calculated = calculate_crc8(data, parser_state.crc_calculated);
+            parser_state.bytes_received++;
+            parser_state.state = 2;
             break;
             
-        case 2: // Состояние 2: Ожидание кода операции
-            parser_state.request.opcode = data;   // Сохраняем код операции
-            parser_state.crc_calculated = calculate_crc8(data, parser_state.crc_calculated);  // Продолжаем CRC
-            parser_state.bytes_received++;        // Увеличиваем счетчик байт
-            parser_state.state = 3;               // Переходим к следующему состоянию
+        case 2: // Ожидание кода операции
+            parser_state.request.opcode = data;
+            parser_state.crc_calculated = calculate_crc8(data, parser_state.crc_calculated);
+            parser_state.bytes_received++;
+            parser_state.state = 3;
             break;
             
-        case 3: // Состояние 3: Ожидание контрольной суммы
-            parser_state.request.crc = data;      // Сохраняем принятую CRC
-            parser_state.bytes_received++;        // Увеличиваем счетчик байт
+        case 3: // Ожидание CRC
+            parser_state.request.crc = data;
+            parser_state.bytes_received++;
             
-            // ПРОВЕРКА ВАЛИДНОСТИ ПАКЕТА:
-            // 1. Принято правильное количество байт
-            // 2. Код операции соответствует ожидаемому (06h)
-            // 3. Рассчитанная CRC совпадает с принятой
             if (parser_state.bytes_received == sizeof(request_frame_t) && 
                 parser_state.request.opcode == OPCODE_REQUEST && 
                 parser_state.crc_calculated == parser_state.request.crc) {
                 
-                // Пакет корректен - формируем и отправляем ответ
-                // Отправляем одни и те же данные
-
-                //TODO Реализовать прием различных данных с датчиков
-                int8_t temperature = 50;        // Пример: температура 50°C
-                uint16_t level = 0x1000;        // Пример: уровень 1000
-                uint16_t frequency = 0x5000;    // Пример: частота 5кГц
+                // TODO: Реализовать прием данных с датчиков
+                int8_t temperature = 50;
+                uint16_t level = 0x1000;
+                uint16_t frequency = 0x5000;
                 
-                // Отправка ответа
-                send_response_internal(parser_state.request.address, temperature, level, frequency);
-
+                send_response_internal(parser_state.request.address, 
+                                     temperature, level, frequency);
             }
-            // Если пакет невалиден - просто игнорируем его
             
-            // Сброс состояния парсера для приема следующего пакета
             parser_state.state = 0;
             parser_state.bytes_received = 0;
             break;
     }
 }
 
-// Инициализация UART интерфейса
-void uart_init(void)
+// Получить данные для отправки
+bool uart_protocol_get_tx_byte(uint8_t *data)
 {
-    // Включение тактирования для USART2 и GPIOA
-    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_USART2);
-    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
-    
-    // Настройка выводов GPIO для UART
-    LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = LL_GPIO_PIN_2 | LL_GPIO_PIN_3;  // PA2-TX, PA3-RX
-    GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;        // Альтернативная функция
-    GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_HIGH;      // Высокая скорость
-    GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL; // Push-Pull выход
-    GPIO_InitStruct.Pull = LL_GPIO_PULL_UP;               // Подтяжка к питанию
-    GPIO_InitStruct.Alternate = LL_GPIO_AF_7;             // AF7 для USART2
-    LL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    
-    // Настройка параметров UART
-    LL_USART_InitTypeDef USART_InitStruct = {0};
-    USART_InitStruct.BaudRate = UART_BAUDRATE;           // 19200 бод
-    USART_InitStruct.DataWidth = LL_USART_DATAWIDTH_8B;  // 8 бит данных
-    USART_InitStruct.StopBits = LL_USART_STOPBITS_1;     // 1 стоп-бит
-    USART_InitStruct.Parity = LL_USART_PARITY_NONE;      // Без четности
-    USART_InitStruct.TransferDirection = LL_USART_DIRECTION_TX_RX; // Прием и передача
-    USART_InitStruct.HardwareFlowControl = LL_USART_HWCONTROL_NONE; // Без аппаратного контроля
-    USART_InitStruct.OverSampling = LL_USART_OVERSAMPLING_16; // 16x oversampling
-    LL_USART_Init(USART2, &USART_InitStruct);
-    
-    // Включение прерываний
-    LL_USART_EnableIT_RXNE(USART2);   // Прерывание при приеме данных
-    LL_USART_EnableIT_ERROR(USART2);  // Прерывание при ошибках
-    
-    // Настройка контроллера прерываний (NVIC)
-    NVIC_SetPriority(USART2_IRQn, 0);    // Высокий приоритет
-    NVIC_EnableIRQ(USART2_IRQn);         // Разрешение прерывания
-    
-    // Инициализация состояния парсера
-    parser_state.state = 0;             // Начальное состояние
-    parser_state.bytes_received = 0;    // Байт не принято
-    
-    // Включение UART
-    LL_USART_Enable(USART2);
+    if (tx_count > 0) {
+        *data = tx_buffer[tx_tail];
+        tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
+        tx_count--;
+        return true;
+    }
+    return false;
 }
 
-// Обработчик прерывания UART - вызывается при событиях на UART
-void USART2_IRQHandler(void)
+// Уведомление об окончании передачи
+void uart_protocol_tx_complete(void)
 {
-    // Обработка приема данных: флаг "Receive Register Not Empty"
-    if (LL_USART_IsActiveFlag_RXNE(USART2) && LL_USART_IsEnabledIT_RXNE(USART2)) {
-        uint8_t data = LL_USART_ReceiveData8(USART2);  // Чтение принятого байта
-        
-        // Немедленная обработка байта (разбор протокола)
-        process_received_byte(data);
-    }
-    
-    // Обработка передачи данных: флаг "Transmit Register Empty"
-    if (LL_USART_IsActiveFlag_TXE(USART2) && LL_USART_IsEnabledIT_TXE(USART2)) {
-        if (tx_count > 0) {  // Если есть данные для передачи
-            // Передача следующего байта из буфера
-            LL_USART_TransmitData8(USART2, tx_buffer[tx_tail]);
-            tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;  // Увеличиваем указатель чтения
-            tx_count--;  // Уменьшаем счетчик байт в буфере
-        } else {
-            // Буфер передачи пуст - отключаем прерывание передачи
-            LL_USART_DisableIT_TXE(USART2);
-            tx_busy = false;  // Сбрасываем флаг занятости передачи
-        }
-    }
-    
-    // Обработка ошибок UART
-    if (LL_USART_IsActiveFlag_ORE(USART2) || LL_USART_IsActiveFlag_FE(USART2) || 
-        LL_USART_IsActiveFlag_NE(USART2) || LL_USART_IsActiveFlag_PE(USART2)) {
-        // Overrun Error - переполнение приемного буфера
-        // Framing Error - ошибка стоп-бита
-        // Noise Error - шумовая ошибка
-        // Parity Error - ошибка четности
-        
-        // Сброс флагов ошибок
-        LL_USART_ClearFlag_ORE(USART2);
-        LL_USART_ClearFlag_FE(USART2);
-        LL_USART_ClearFlag_NE(USART2);
-        LL_USART_ClearFlag_PE(USART2);
-        
-        // Сброс состояния парсера при ошибке (начало поиска нового пакета)
-        parser_state.state = 0;
-        parser_state.bytes_received = 0;
+    // Если есть еще данные для передачи, продолжаем
+    if (tx_count > 0 && hardware_enable_tx_interrupt) {
+        hardware_enable_tx_interrupt();
     }
 }
